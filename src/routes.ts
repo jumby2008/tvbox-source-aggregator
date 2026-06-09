@@ -10,7 +10,8 @@ import { loadGroupOrder, saveGroupOrder } from './core/group-order';
 import { parseConfigJson, isMultiRepoConfig, extractMultiRepoEntries } from './core/fetcher';
 import { decodeConfigResponse } from './core/decoder';
 import { validateMacCMS } from './core/maccms';
-import { lookupJarUrl, isMd5Key, base64ToUint8Array } from './core/jar-proxy';
+import { lookupJarUrl, isMd5Key, base64ToUint8Array, rewriteJarUrls } from './core/jar-proxy';
+import { BASE_URL_PLACEHOLDER } from './core/config';
 import { lookupLiveUrl } from './core/live-source';
 import { adminHtml } from './core/admin';
 import { dashboardHtml } from './core/dashboard';
@@ -21,7 +22,7 @@ import { loadCredentials, saveCredential, deleteCredential, loadCredentialPolicy
 import { generateQR, pollQRStatus, passwordLogin, PLATFORM_NAMES, QR_PLATFORMS, PASSWORD_PLATFORMS } from './core/cloud-login';
 import { assessAllSources } from './core/credential-risk';
 import { generateTokenJson } from './core/credential-injector';
-import { formatLiveGroupsAsTxt } from './core/live-merger';
+import { formatLiveGroupsAsTxt, fetchAndParseLiveUrls } from './core/live-merger';
 import type { TVBoxConfig, SearchQuotaConfig, CloudPlatform, CloudCredential, TVBoxLiveGroup } from './core/types';
 import { mountChannelProbeRoutes } from './routes/channel-probe-admin';
 
@@ -143,12 +144,31 @@ export function createApp(deps: AppDeps): Hono {
       const full = JSON.parse(cached);
       const lives = full.lives || [];
 
-      // CF 模式可能仍保留 FongMi live entries（type/url/api），此时保持旧 JSON 输出兼容。
+      // FongMi 格式（type/url/api 指针）：实时下载并解析为 txt 格式
       if (!isNativeLiveGroups(lives)) {
-        const liveConfig = { lives };
-        return c.body(JSON.stringify(liveConfig), 200, {
-          'Content-Type': 'application/json; charset=utf-8',
-          'Cache-Control': 'public, max-age=1800',
+        const liveUrls: Array<{ name: string; url: string; header?: Record<string, string> }> = [];
+        for (const entry of lives) {
+          const url = entry.url || entry.api;
+          if (url && typeof url === 'string') {
+            liveUrls.push({ name: entry.name || url, url, header: entry.header });
+          }
+        }
+        if (liveUrls.length > 0) {
+          try {
+            const groups = await fetchAndParseLiveUrls(liveUrls, 8000);
+            if (groups.length > 0) {
+              return c.body(formatLiveGroupsAsTxt(groups), 200, {
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': 'public, max-age=1800',
+                'Access-Control-Allow-Origin': '*',
+              });
+            }
+          } catch { /* fall through to JSON fallback */ }
+        }
+        // 无法解析时返回空 txt
+        return c.body('', 200, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'public, max-age=300',
           'Access-Control-Allow-Origin': '*',
         });
       }
@@ -1469,13 +1489,30 @@ export function createApp(deps: AppDeps): Hono {
     if (!fullRaw) return;
     const blacklist = await loadBlacklist(storage);
     const hasBlacklist = blacklist.sites.length > 0 || blacklist.parses.length > 0 || blacklist.lives.length > 0 || blacklist.regexRules.some(r => r.enabled);
+
+    let result: TVBoxConfig;
     if (!hasBlacklist) {
-      await storage.put(KV_MERGED_CONFIG, fullRaw);
-      return;
+      result = JSON.parse(fullRaw);
+    } else {
+      const fullConfig: TVBoxConfig = JSON.parse(fullRaw);
+      const { config: filtered } = await applyBlacklist(fullConfig, blacklist);
+      result = filtered;
     }
-    const fullConfig: TVBoxConfig = JSON.parse(fullRaw);
-    const { config: filtered } = await applyBlacklist(fullConfig, blacklist);
-    await storage.put(KV_MERGED_CONFIG, JSON.stringify(filtered));
+
+    // 保留当前已合并的 Native lives（避免回退到 FongMi 格式）
+    const currentRaw = await storage.get(KV_MERGED_CONFIG);
+    if (currentRaw) {
+      try {
+        const current: TVBoxConfig = JSON.parse(currentRaw);
+        if (Array.isArray(current.lives) && current.lives.length > 0 && current.lives[0]?.group) {
+          result.lives = current.lives;
+        }
+      } catch { /* ignore parse error */ }
+    }
+
+    // 重新应用 JAR proxy rewrite（与 aggregator Step 7 一致）
+    result = await rewriteJarUrls(result, BASE_URL_PLACEHOLDER, storage);
+    await storage.put(KV_MERGED_CONFIG, JSON.stringify(result));
   }
 
   // ─── 正则黑名单 ─────────────────────────────────────────
